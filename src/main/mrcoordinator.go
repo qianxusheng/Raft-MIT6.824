@@ -9,10 +9,13 @@ package main
 // Please do not change this file.
 //
 
-import "6.5840/mr"
-import "time"
-import "os"
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"6.5840/mr"
+)
 
 func main() {
 	if len(os.Args) < 2 {
@@ -20,6 +23,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 这个main进程就是coordinator，然后call server，是一个thread，监听rpc from worker
 	m := mr.MakeCoordinator(os.Args[1:], 10)
 	for m.Done() == false {
 		time.Sleep(time.Second)
