@@ -9,12 +9,14 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -47,7 +49,7 @@ type Raft struct {
 	state         int
 	lastHeartbeat time.Time
 	// persist on disk
-	currentTerm int // logical clock，用于处理unreliable的网络问题，保证RPC有序
+	currentTerm int
 	votedFor    int
 	log         []Entry
 
@@ -89,12 +91,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (3C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -104,17 +107,20 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (3C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var votedFor int
+	var currentTerm int
+	var log []Entry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		return
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 // how many bytes in Raft's persisted log?
@@ -168,6 +174,11 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	// optimization for fast backoff
+	XTerm  int
+	XIndex int
+	Xlen   int
 }
 
 // RPC handler, need to be captialized
@@ -179,21 +190,46 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Term = rf.currentTerm
 	reply.Success = false
+	reply.XIndex = -1
+	reply.XTerm = -1
+	reply.Xlen = -1
 	// reject，只有合法leader才能镇压suppress
 	if args.Term < rf.currentTerm {
 		return
 	}
 
 	// heartbeat
+	// term只是逻辑clock，中间无所谓，只需要知道现在是什么term
+	// log靠prevLog机制追赶，不用担心
 	rf.lastHeartbeat = time.Now()
-	rf.currentTerm = args.Term
-	rf.state = Follower
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.state = Follower
+		rf.persist()
+	}
 
-	// prevLog一致性检查, prevLog consistency check
-	if args.PrevLogIndex >= len(rf.log) { // log太短，follower起码能有这么长的log
+	// leader初始化nextIndex的时候，默认follower的log和自己一样长，所以会有此case
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.Xlen = len(rf.log)
 		return
 	}
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm { // term不匹配
+
+	// term不匹配，返回冲突term和冲突term的第一个index（follower中的）
+	// 一般就是因为网络partition问题，follower的log比leader长导致的，需要同步
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.XTerm = rf.log[args.PrevLogIndex].Term
+		reply.XIndex = args.PrevLogIndex
+		// prevLogIndex = 7
+		//           1 2 3 4 5 6 7 8 9
+		// leader:   2 3 3 5 5 5 5 5 5 leader发现根本没有term 7，全部删除掉
+		// follower: 2 3 3 7 7 7 7 8 9
+		// prevLogIndex = 7
+		//           1 2 3 4 5 6 7 8 9
+		// leader:   2 3 3 7 7 8 8 8 8 leader发现有term 7，找到term 7的分叉点
+		// follower: 2 3 3 7 7 7 7 8 9
+		for reply.XIndex > 0 && rf.log[reply.XIndex-1].Term == reply.XTerm {
+			reply.XIndex--
+		}
 		return
 	}
 
@@ -207,10 +243,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if rf.log[idx].Term != entry.Term {
 				rf.log = rf.log[:idx]                        // 截至idx
 				rf.log = append(rf.log, args.Entries[i:]...) // append正确的
+				rf.persist()
 				break
 			}
 		} else {
 			rf.log = append(rf.log, args.Entries[i:]...) // 这是normal case
+			rf.persist()
 			break
 		}
 	}
@@ -265,10 +303,13 @@ func (rf *Raft) sendAppendEntries() {
 					return
 				}
 
+				// 退位
+				// term同步
 				if reply.Term > rf.currentTerm {
 					rf.currentTerm = reply.Term
 					rf.state = Follower
 					rf.votedFor = -1
+					rf.persist()
 				}
 
 				// 处理reply
@@ -298,17 +339,35 @@ func (rf *Raft) sendAppendEntries() {
 				} else {
 					// 4. append失败
 					// 回退，找到match点
-					rf.nextIndex[server]--
+					found := false
+					if reply.Xlen != -1 {
+						rf.nextIndex[server] = reply.Xlen
+					} else {
+						// Xlen此处已经>=leader的len(log)了，所以从rf没毛病 \
+						// 不需要从nextIndex[server]开始，因为如果follower的log短直接就跑上面的if了
+
+						// 有XTerm，一个个往回找nextIndex[server]--（就是原版）
+						for i := len(rf.log) - 1; i > 0; i-- {
+							if rf.log[i].Term == reply.XTerm {
+								rf.nextIndex[server] = i + 1
+								found = true
+								break
+							}
+						}
+						// 没有XTerm，直接跳转到这里
+						if !found {
+							rf.nextIndex[server] = reply.XIndex
+						}
+					}
 				}
 			}(i)
 		}
 	}
 }
 
-// 分析case的时候需要先保证这种case发生，然后handle这种case产生的问题
-// 略有担心未来的leader抢不到startElection
-// 听说随机化能解决这个问题（概率问题？也不是概率问题）
-// 不用担心，辣鸡candidate被reject后进入follower，然后electiontimeout，就不会捣乱了
+// 主要就是分析partition的问题
+// 如果一个4一个5，term4先抢到了，然后term4+1=term5，term没啥用，还是比较log，所以原来的term5还是会赢
+// 如果已经投给了当前的candidate，不需要特殊处理，因为这个操作是幂等的idempotent
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
@@ -317,45 +376,27 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
-	// logical clock, prevent outdated candidates
-	// 僵尸candidate，reject
+	// 如果candidate的term过期了，就reject，candidate就会降为follower
 	if args.Term < rf.currentTerm {
 		return
 	}
 
-	// case1:
-	// s1: term 10, [1, 1, 1]
-	// ---------------------- partition
-	// s2(leader): term 5, [1, 1, 1, 4, 4]
-	// leader还是要退位，进行下一轮选举（还是能赢）
-	// Term是逻辑时钟，要同步
-	// case2:
-	// 正常情况下，s1(term)就要投给s2(term + 1)，然后更新term和votedFor（这一轮投过了）
-	// case3:
-	// 两个candidate同时发起election，打成平手，互相要票->看谁的log比较完整
+	// 同步term
+	// 重置vote
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.state = Follower
 		rf.votedFor = -1
 		reply.Term = rf.currentTerm
+		rf.persist()
 	}
 
-	// 可能已经投过别人了
-	// case4：
-	// 当前raft已经投过别人了，然后term变成了5（当前最新term）
+	// 不能重复投票
 	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
 		return
 	}
 
-	// case5:网络问题
-	// s1: 3 4 4 4  假设s1恢复网络然后发起选举，发现自己term和s2相等
-	// ------------
-	// s2（多数）：3 4 4 5  但是s1拿不到leader，s1timeout，然后s2拿到，一切恢复正常
-	// case6
-	// s1（多数）: 3 4 4 4
-	// -----------
-	// s2: 3 4 4 5   这个case不可能发生，因为虽然term++，但是永远不会写入
-	// election restriction
+	// 根据lastLog进行PK
 	myLastLogIndex := len(rf.log) - 1
 	myLastLogTerm := 0
 	if myLastLogIndex >= 0 {
@@ -363,15 +404,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	upToDate := args.LastLogTerm > myLastLogTerm ||
 		((args.LastLogTerm == myLastLogTerm) && (args.LastLogIndex >= myLastLogIndex))
+	// 输了，return
 	if !upToDate {
 		return
 	}
 
-	// grant vote
+	// 赢了，投票，persist
 	rf.state = Follower
 	rf.lastHeartbeat = time.Now()
 	rf.votedFor = args.CandidateId
 	reply.VoteGranted = true
+	rf.persist()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -436,6 +479,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index = len(rf.log)
 	term = rf.currentTerm
 	rf.log = append(rf.log, Entry{Term: rf.currentTerm, Command: command})
+	rf.persist()           // leader persist
 	rf.sendAppendEntries() // try to make agreement
 
 	return index, term, isLeader
@@ -499,6 +543,7 @@ func (rf *Raft) startElection() {
 	rf.lastHeartbeat = time.Now()
 	rf.state = Candidate
 	term := rf.currentTerm
+	rf.persist()
 	rf.mu.Unlock()
 
 	vote := 1 // 给自己vote；这里的vote会被spawn的gproutine捕获，所以修改这个vote需要lock
@@ -531,6 +576,7 @@ func (rf *Raft) startElection() {
 					rf.state = Follower
 					rf.votedFor = -1
 					rf.currentTerm = reply.Term // 更新term；我们可以直接强制转换，后续处理好uncommited log
+					rf.persist()
 					return
 				}
 				if reply.VoteGranted { // 得票，+=1
